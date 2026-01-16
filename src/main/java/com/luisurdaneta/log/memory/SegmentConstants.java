@@ -1,7 +1,14 @@
 package com.luisurdaneta.log.memory;
 
+import java.lang.foreign.ValueLayout;
+import java.nio.ByteOrder;
+
 final class SegmentConstants {
     private SegmentConstants() {}
+
+    static final ValueLayout.OfInt INT_LE = ValueLayout.JAVA_INT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
+    static final ValueLayout.OfLong LONG_LE = ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
+    static final ValueLayout.OfShort SHORT_LE = ValueLayout.JAVA_SHORT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
 
     // ------------------------------------------------------------
     // File / format identifiers

@@ -4,8 +4,6 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
 import java.lang.foreign.MemorySegment;
-import java.lang.foreign.ValueLayout;
-import java.nio.ByteOrder;
 import java.nio.file.Files;
 import java.nio.file.Path;
 
@@ -13,9 +11,6 @@ import static com.luisurdaneta.log.memory.SegmentConstants.*;
 import static org.junit.jupiter.api.Assertions.*;
 
 public class LogSegmentIntegrationTest {
-
-    private static final ValueLayout.OfInt  INT_LE  = ValueLayout.JAVA_INT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
-    private static final ValueLayout.OfLong LONG_LE = ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
 
     @TempDir
     Path dir;

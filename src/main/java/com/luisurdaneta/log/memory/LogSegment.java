@@ -4,9 +4,7 @@ import static com.luisurdaneta.log.memory.SegmentConstants.*;
 import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
-import java.lang.foreign.ValueLayout;
 import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
 import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Path;
@@ -92,11 +90,6 @@ import java.util.zip.CRC32C;
  */
 
 public final class LogSegment implements AutoCloseable {
-
-    // ValueLayout for native access (little-endian)
-    private static final ValueLayout.OfInt INT_LE = ValueLayout.JAVA_INT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
-    private static final ValueLayout.OfLong LONG_LE = ValueLayout.JAVA_LONG_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
-    private static final ValueLayout.OfShort SHORT_LE = ValueLayout.JAVA_SHORT_UNALIGNED.withOrder(ByteOrder.LITTLE_ENDIAN);
 
     // Instance state - immutable after construction
     private final Path filePath;
@@ -418,10 +411,8 @@ public final class LogSegment implements AutoCloseable {
         // Force any pending writes
         segment.force();
 
-        // Close arena (will unmap segment)
         arena.close();
 
-        // Close channel
         channel.close();
     }
 
