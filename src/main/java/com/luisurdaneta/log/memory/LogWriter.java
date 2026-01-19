@@ -1,6 +1,5 @@
 package com.luisurdaneta.log.memory;
 
-
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.util.zip.CRC32C;
@@ -8,47 +7,64 @@ import java.util.zip.CRC32C;
 import static com.luisurdaneta.log.memory.SegmentConstants.*;
 
 /**
- * LogWriter - append-side writer for a mapped {@link LogSegment}.
+ * =============================================================================
+ * LogWriter — QLOG Segment Format v2 (Simplified Append-Only)
+ * =============================================================================
  *
- * Design:
- *  - Single-writer thread (no locks, no contention)
- *  - Append-only, 64B aligned entries
- *  - Two-phase publish:
- *      append(...) writes bytes but does NOT advance committed tail
- *      commit() updates superblock committed_tail / entry_count / last_seq (publication barrier)
+ * Writer model
+ * ------------
+ * • Single-writer per segment instance (enforced by owner thread check)
+ * • Appends entries into the mmap region starting at current committed_tail
+ * • Entries are NOT visible to readers until commit() advances superblock committed_tail
+ * • "All-or-nothing": data beyond committed_tail is ignored on recovery
  *
- * This matches LogReader semantics: readers scan up to committedTailSnapshot().
+ * Entry layout (v2)
+ * -----------------
+ *   entry_start (16B aligned):
+ *     [32B header]
+ *     [payload_len bytes payload]
+ *     [0..15B padding to 16B]
+ *
+ * Header fields (32B):
+ *   0x00 u32 magic = "ENTR"
+ *   0x04 u16 header_bytes = 32
+ *   0x06 u16 flags
+ *   0x08 u32 type
+ *   0x0C u32 codec
+ *   0x10 u64 ts_unix_nanos    (LWW timestamp)
+ *   0x18 u32 payload_len      (bytes on disk)
+ *   0x1C u32 payload_crc32c   (optional; 0 if unused)
+ *
+ * Notes
+ * -----
+ * • No seq, no header CRC, no total_len stored (derived).
+ * • CRC32C is computed from source payload bytes (no second pass over mapped memory).
+ * • Padding is derived and optionally zeroed (keeps file deterministic).
  */
+
 public final class LogWriter implements AutoCloseable {
 
-    // For power-of-two alignment ops
+    // Power-of-two alignment ops
     private static final int ALIGN_MASK = ENTRY_ALIGNMENT - 1;
 
     static {
-        // Fail fast if someone changes alignment to non-power-of-two.
         if ((ENTRY_ALIGNMENT & (ENTRY_ALIGNMENT - 1)) != 0) {
             throw new ExceptionInInitializerError("ENTRY_ALIGNMENT must be power of two: " + ENTRY_ALIGNMENT);
         }
-        if (ENTRY_HEADER_SIZE <= 0 || ENTRY_HEADER_SIZE > 512) {
+        if (ENTRY_HEADER_SIZE <= 0 || ENTRY_HEADER_SIZE > 256) {
             throw new ExceptionInInitializerError("ENTRY_HEADER_SIZE looks wrong: " + ENTRY_HEADER_SIZE);
+        }
+        if (ENTRY_HEADER_SIZE != 32) {
+            // Keep this strict until you intentionally rev the format again.
+            throw new ExceptionInInitializerError("ENTRY_HEADER_SIZE must be 32 for v2 layout: " + ENTRY_HEADER_SIZE);
         }
     }
 
-    // Scratch (avoid per-append allocations)
-    private static final int SCRATCH_BYTES = 64 * 1024;
-
-    private static final class Scratch {
-        final byte[] bytes = new byte[SCRATCH_BYTES];
-        final MemorySegment seg = MemorySegment.ofArray(bytes);
-    }
-
-    private static final ThreadLocal<Scratch> SCRATCH =
-            ThreadLocal.withInitial(Scratch::new);
-
+    // Reusable CRC32C instance (ThreadLocal)
     private static final ThreadLocal<CRC32C> CRC =
             ThreadLocal.withInitial(CRC32C::new);
 
-    // ------------------------------------------------------------
+    // -------------------------------------------------------------------------
 
     private final LogSegment seg;
     private final MemorySegment ms;
@@ -57,43 +73,38 @@ public final class LogWriter implements AutoCloseable {
     // Single-writer enforcement
     private final Thread ownerThread;
 
-    // Uncommitted (private writer state)
-    private long tail;        // next append position (uncommitted)
-    private long entryCount;  // uncommitted count
-    private long nextSeq;     // next sequence to assign (lastSeq + 1)
-
-    // Batching counters (optional)
+    // Uncommitted writer state
+    private long tail; // next append position (uncommitted)
     private long pendingEntries;
     private long pendingBytes;
 
     // Defaults
-    private final int defaultFlags;
-    private final int defaultType;
-    private final int defaultCodec;
+    private final int defaultFlags; // ENT_FLAGS (u16, but stored in int)
+    private final int defaultType;  // ENT_TYPE (u32)
+    private final int defaultCodec; // ENT_CODEC (u32)
+    private final boolean defaultCrcEnabled;
 
     public LogWriter(LogSegment seg) {
-        this(seg, 0, 1, 0); // flags=0, type=1, codec=0
+        this(seg, /*flags*/0, /*type*/1, /*codec*/0, /*crcEnabled*/true);
     }
 
-    public LogWriter(LogSegment seg, int defaultFlags, int defaultType, int defaultCodec) {
+    public LogWriter(LogSegment seg, int defaultFlags, int defaultType, int defaultCodec, boolean crcEnabled) {
         if (seg == null) throw new NullPointerException("seg");
         this.seg = seg;
         this.ms = seg.getSegment();
         this.fileCapacity = seg.getFileCapacity();
 
-        this.defaultFlags = defaultFlags;
+        this.defaultFlags = defaultFlags & 0xFFFF;
         this.defaultType = defaultType;
         this.defaultCodec = defaultCodec;
+        this.defaultCrcEnabled = crcEnabled;
 
         this.ownerThread = Thread.currentThread();
 
-        // Start from committed superblock snapshot
+        // Start from committed snapshot
         this.tail = seg.getCommittedTail();
-        this.entryCount = seg.getEntryCount();
-        long lastSeq = seg.getLastSeq();
-        this.nextSeq = lastSeq + 1;
 
-        // Safety: tail must be aligned and >= DATA_OFFSET
+        // Safety checks
         if (tail < DATA_OFFSET) {
             throw new IllegalStateException("Committed tail < DATA_OFFSET: " + tail);
         }
@@ -105,44 +116,52 @@ public final class LogWriter implements AutoCloseable {
         }
     }
 
-    // ------------------------------------------------------------
+    // -------------------------------------------------------------------------
     // Public API
-    // ------------------------------------------------------------
+    // -------------------------------------------------------------------------
 
     /** Current uncommitted tail (next append offset). */
-    public long tail() {
-        return tail;
+    public long tail() { return tail; }
+
+    /** Pending entries since last commit. */
+    public long pendingEntries() { return pendingEntries; }
+
+    /** Pending bytes since last commit. */
+    public long pendingBytes() { return pendingBytes; }
+
+    /** Append with defaults; timestamp set to now (unix nanos). Returns entry start offset. */
+    public long append(byte[] payload) {
+        return append(payload, 0, payload.length, defaultFlags, defaultType, defaultCodec, nowUnixNanos(), defaultCrcEnabled);
     }
 
-    /** Current uncommitted entry count. */
-    public long entryCount() {
-        return entryCount;
-    }
-
-    /** Next seq that will be assigned on append. */
-    public long nextSeq() {
-        return nextSeq;
+    /** Append with explicit header fields; timestamp set to now (unix nanos). Returns entry start offset. */
+    public long append(byte[] payload, int flags, int type, int codec) {
+        return append(payload, 0, payload.length, flags, type, codec, nowUnixNanos(), defaultCrcEnabled);
     }
 
     /**
-     * Append payload bytes as a log entry.
+     * Append payload as an entry. Returns the entry start offset (useful as a stable handle).
      *
-     * Returns the assigned sequence number.
-     * DOES NOT publish to readers until commit() is called.
+     * The entry is not visible to readers until commit() is called.
      */
-    public long append(byte[] payload) {
-        return append(payload, 0, payload.length, defaultFlags, defaultType, defaultCodec, nowUnixNanos());
-    }
-
-    public long append(byte[] payload, int flags, int type, int codec) {
-        return append(payload, 0, payload.length, flags, type, codec, nowUnixNanos());
-    }
-
-    public long append(byte[] payload, int off, int len, int flags, int type, int codec, long tsUnixNanos) {
+    public long append(byte[] payload,
+                       int off,
+                       int len,
+                       int flags,
+                       int type,
+                       int codec,
+                       long tsUnixNanos,
+                       boolean crcEnabled) {
         checkThread();
         if (payload == null) throw new NullPointerException("payload");
         if (off < 0 || len < 0 || off + len > payload.length) {
             throw new IndexOutOfBoundsException("off=" + off + " len=" + len + " payloadLen=" + payload.length);
+        }
+        if (len == 0) {
+            throw new IllegalArgumentException("Zero-length payload not allowed (simplifies readers & avoids ambiguity).");
+        }
+        if (tsUnixNanos <= 0) {
+            throw new IllegalArgumentException("tsUnixNanos must be > 0 for LWW: " + tsUnixNanos);
         }
 
         // Compute layout
@@ -157,102 +176,89 @@ public final class LogWriter implements AutoCloseable {
                     "Segment full: need " + totalLen + " bytes at tail=" + tail + " but capacity=" + fileCapacity);
         }
 
-        long seq = nextSeq++;
-
-        // Write payload first (writer-private until commit)
+        // ----------------------------
+        // Write payload (writer-private)
+        // ----------------------------
         long payloadOff = entryStart + ENTRY_HEADER_SIZE;
         MemorySegment.copy(MemorySegment.ofArray(payload), off, ms, payloadOff, len);
 
-        // Zero padding (not strictly required, but keeps file clean / deterministic)
+        // Optional: zero padding for determinism / cleaner scans
         if (padding != 0) {
-            long padStart = payloadOff + len;
-            for (int i = 0; i < padding; i++) {
-                ms.set(ValueLayout.JAVA_BYTE, padStart + i, (byte) 0);
-            }
+            zeroRange(payloadOff + len, padding);
         }
 
-        // Compute payload CRC over source bytes (no second pass over mapped memory)
-        int payloadCrc = crc32c(payload, off, len);
+        // ----------------------------
+        // Compute CRC32C over SOURCE bytes (no second pass over mmap)
+        // ----------------------------
+        int payloadCrc = 0;
+        int hdrFlags = (flags & 0xFFFF);
 
-        // Write header with CRC fields as ZERO (required for header CRC to match "zeroed CRC" convention)
-        writeHeaderZeroCrc(
+        if (crcEnabled) {
+            payloadCrc = crc32c(payload, off, len);
+            hdrFlags |= ENT_FLAG_HAS_CRC;
+        } else {
+            hdrFlags &= ~ENT_FLAG_HAS_CRC;
+        }
+
+        // Caller can also set ENT_FLAG_COMPRESSED if codec != 0
+        // (we don't enforce; reader will interpret based on flags/codec)
+        // If you want strictness:
+        // if (codec != 0) hdrFlags |= ENT_FLAG_COMPRESSED;
+
+        // ----------------------------
+        // Write header
+        // ----------------------------
+        writeHeader(
                 entryStart,
-                flags,
+                hdrFlags,
                 type,
                 codec,
-                seq,
                 tsUnixNanos,
-                /*compressedLen*/ len,
-                /*rawLen*/ len,
-                totalLen,
-                padding
+                len,
+                payloadCrc
         );
-
-        // Compute header CRC over header bytes with CRC fields still zero
-        int headerCrc = computeHeaderCrcZeroed(entryStart);
-
-        // Now store CRC fields (reader will zero them when validating header CRC)
-        ms.set(INT_LE, entryStart + ENT_PAYLOAD_CRC, payloadCrc);
-        ms.set(INT_LE, entryStart + ENT_HEADER_CRC, headerCrc);
 
         // Advance uncommitted state
         tail = entryEnd;
-        entryCount++;
         pendingEntries++;
         pendingBytes += totalLen;
 
-        return seq;
+        return entryStart;
     }
 
-    /**
-     * Publish all appended entries since last commit to readers by advancing superblock committed tail.
-     *
-     * This is your "release" barrier: only after this does LogReader see new entries.
-     */
-    public void commit() {
-        commit(false);
-    }
+    /** Publish appended entries by advancing superblock committed_tail. */
+    public void commit() { commit(false); }
 
     /**
-     * Commit, optionally forcing to disk.
-     * force==true is expensive (msync).
+     * Commit, optionally forcing to disk (msync).
+     * force==true is expensive; use for group commit / durability points.
      */
     public void commit(boolean force) {
         checkThread();
+        if (pendingEntries == 0) return;
 
-        if (pendingEntries == 0) return; // nothing to do
+        seg.checkpointCommittedTail(tail);
 
-        // Publish: checkpoint writes committed_tail/count/seq + superblock CRC, then updates volatiles.
-        seg.checkpointSuperblock(tail, entryCount, nextSeq - 1);
-
-        // Optional durability
-        if (force) {
-            seg.sync();
-        }
+        if (force) seg.sync();
 
         pendingEntries = 0;
         pendingBytes = 0;
     }
 
-    /**
-     * Convenience: append + commit.
-     * Slower but simple for early testing.
-     */
+    /** Convenience: append + commit (no force). */
     public long appendAndCommit(byte[] payload) {
-        long seq = append(payload);
+        long off = append(payload);
         commit(false);
-        return seq;
+        return off;
     }
 
-    /** Commit + force (durable group commit). */
+    /** Commit + force. */
     public void commitAndSync() {
         commit(true);
     }
 
     @Override
     public void close() {
-        // For a writer, closing without publishing is almost always "oops".
-        // Commit without force; caller can sync if they want.
         try {
             commit(false);
         } catch (Throwable ignored) {
@@ -260,9 +266,9 @@ public final class LogWriter implements AutoCloseable {
         }
     }
 
-    // ------------------------------------------------------------
+    // -------------------------------------------------------------------------
     // Internals
-    // ------------------------------------------------------------
+    // -------------------------------------------------------------------------
 
     private void checkThread() {
         if (Thread.currentThread() != ownerThread) {
@@ -282,7 +288,6 @@ public final class LogWriter implements AutoCloseable {
     }
 
     private static int checkedTotalLen(int payloadLen, int padding) {
-        // totalLen = header + payload + padding (all int)
         long total = (long) ENTRY_HEADER_SIZE + (long) payloadLen + (long) padding;
         if (total > Integer.MAX_VALUE) {
             throw new IllegalArgumentException("Entry too large: totalLen overflows int: " + total);
@@ -290,62 +295,41 @@ public final class LogWriter implements AutoCloseable {
         return (int) total;
     }
 
-    private void writeHeaderZeroCrc(long entryStart,
-                                    int flags,
-                                    int type,
-                                    int codec,
-                                    long seq,
-                                    long tsUnixNanos,
-                                    int compressedLen,
-                                    int rawLen,
-                                    int totalLen,
-                                    int paddingLen) {
+    private void writeHeader(long entryStart,
+                             int flagsU16,
+                             int typeU32,
+                             int codecU32,
+                             long tsUnixNanos,
+                             int payloadLenU32,
+                             int payloadCrc32c) {
 
-        ms.set(INT_LE, entryStart + ENT_MAGIC, MAGIC_ENTR);
+        ms.set(INT_LE,   entryStart + ENT_MAGIC, MAGIC_ENTR);
         ms.set(SHORT_LE, entryStart + ENT_HEADER_BYTES, (short) ENTRY_HEADER_SIZE);
-        ms.set(SHORT_LE, entryStart + ENT_VERSION, (short) VERSION);
+        ms.set(SHORT_LE, entryStart + ENT_FLAGS, (short) (flagsU16 & 0xFFFF));
 
-        ms.set(INT_LE, entryStart + ENT_FLAGS, flags);
-        ms.set(SHORT_LE, entryStart + ENT_TYPE, (short) type);
-        ms.set(SHORT_LE, entryStart + ENT_CODEC, (short) codec);
+        ms.set(INT_LE, entryStart + ENT_TYPE, typeU32);
+        ms.set(INT_LE, entryStart + ENT_CODEC, codecU32);
 
-        ms.set(LONG_LE, entryStart + ENT_SEQ, seq);
         ms.set(LONG_LE, entryStart + ENT_TS_UNIX_NANOS, tsUnixNanos);
 
-        ms.set(INT_LE, entryStart + ENT_COMPRESSED_LEN, compressedLen);
-        ms.set(INT_LE, entryStart + ENT_UNCOMPRESSED_LEN, rawLen);
+        ms.set(INT_LE, entryStart + ENT_PAYLOAD_LEN, payloadLenU32);
 
-        ms.set(INT_LE, entryStart + ENT_TOTAL_LEN, totalLen);
-        ms.set(SHORT_LE, entryStart + ENT_PADDING_LEN, (short) paddingLen);
+        // If CRC disabled, this will be 0 and ENT_FLAG_HAS_CRC will be unset.
+        ms.set(INT_LE, entryStart + ENT_PAYLOAD_CRC32, payloadCrc32c);
+    }
 
-        // CRC fields must be ZERO while computing header CRC
-        ms.set(INT_LE, entryStart + ENT_PAYLOAD_CRC, 0);
-        ms.set(INT_LE, entryStart + ENT_HEADER_CRC, 0);
+    private void zeroRange(long start, int len) {
+        // Byte-wise zero is fine; small (0..15).
+        // Keep it simple; if you later align bigger, you can optimize.
+        for (int i = 0; i < len; i++) {
+            ms.set(ValueLayout.JAVA_BYTE, start + i, (byte) 0);
+        }
     }
 
     private static int crc32c(byte[] data, int off, int len) {
         CRC32C crc = CRC.get();
         crc.reset();
         crc.update(data, off, len);
-        return (int) crc.getValue();
-    }
-
-    /**
-     * Compute header CRC32C over 64 bytes with BOTH CRC fields treated as zero.
-     * Writer guarantees CRC fields are currently zero, so this is just CRC(headerBytes).
-     *
-     * Uses scratch copy: no allocation, no writes to mapped memory besides initial header write.
-     */
-    private int computeHeaderCrcZeroed(long entryStart) {
-        CRC32C crc = CRC.get();
-        crc.reset();
-
-        Scratch scratch = SCRATCH.get();
-
-        // Copy header bytes into scratch and CRC them
-        MemorySegment.copy(ms, entryStart, scratch.seg, 0, (long) ENTRY_HEADER_SIZE);
-        crc.update(scratch.bytes, 0, ENTRY_HEADER_SIZE);
-
         return (int) crc.getValue();
     }
 }
