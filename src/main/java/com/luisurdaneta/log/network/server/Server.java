@@ -1,5 +1,7 @@
 package com.luisurdaneta.log.network.server;
 
+import com.luisurdaneta.log.network.protocol.ConnectionHandler;
+
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.channels.AsynchronousCloseException;

@@ -1,4 +1,4 @@
-package com.luisurdaneta.log.network.server;
+package com.luisurdaneta.log.network.protocol;
 
 import java.io.IOException;
 import java.nio.channels.SocketChannel;
