@@ -1,23 +1,25 @@
-package com.luisurdaneta.log.memory;
+package com.luisurdaneta.log.memory.io;
+import com.luisurdaneta.log.memory.segment.LogSegment;
+
 import java.lang.foreign.MemorySegment;
 import java.nio.ByteBuffer;
 import java.util.zip.CRC32C;
 
-import static com.luisurdaneta.log.memory.SegmentConstants.*;
+import static com.luisurdaneta.log.memory.segment.SegmentConstants.*;
 
 /**
  * =============================================================================
- * LogReader — QLOG Segment v2 Reader (Simplified Layout)
+ * LogReader
  * =============================================================================
- *
+
  * This reader scans committed entries in a memory-mapped LogSegment (v2).
- *
+
  * Key properties:
  *  • Single source of truth for visibility: superblock COMMITTED_TAIL
  *  • Entries are fixed-header + payload + derived padding (alignment)
  *  • No streaming write support: if entry bytes are within committed_tail,
  *    they are considered fully written (writer only advances tail after writing).
- *
+
  * Entry header (32 bytes):
  *   0x00 u32 magic         = "ENTR"
  *   0x04 u16 header_bytes  = 32
@@ -27,17 +29,18 @@ import static com.luisurdaneta.log.memory.SegmentConstants.*;
  *   0x10 u64 ts_unix_nanos
  *   0x18 u32 payload_len
  *   0x1C u32 payload_crc32 (optional; only valid if flags bit ENT_FLAG_HAS_CRC)
- *
+
  * Entry total length is derived:
  *   base = ENTRY_HEADER_SIZE + payload_len
  *   pad  = (ENTRY_ALIGNMENT - (base % ENTRY_ALIGNMENT)) % ENTRY_ALIGNMENT
  *   total_len = base + pad
- *
+
  * This class provides:
  *  • scan(start, tailSnapshot, maxEntries, handler)
  *  • scanAll(handler)
  *  • lastValidOffset(tailSnapshot) for repair/truncation discovery
  */
+
 public final class LogReader {
 
     // Chunk size used only if you decide to compute CRC by copying mapped bytes.

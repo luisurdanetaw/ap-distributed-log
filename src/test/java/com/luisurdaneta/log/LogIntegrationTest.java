@@ -1,9 +1,9 @@
 package com.luisurdaneta.log;
 
 
-import com.luisurdaneta.log.memory.LogReader;
-import com.luisurdaneta.log.memory.LogSegment;
-import com.luisurdaneta.log.memory.LogWriter;
+import com.luisurdaneta.log.memory.io.LogReader;
+import com.luisurdaneta.log.memory.segment.LogSegment;
+import com.luisurdaneta.log.memory.io.LogWriter;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -13,7 +13,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 
-import static com.luisurdaneta.log.memory.SegmentConstants.DATA_OFFSET;
+import static com.luisurdaneta.log.memory.segment.SegmentConstants.DATA_OFFSET;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**

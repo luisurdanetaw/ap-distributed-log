@@ -1,20 +1,21 @@
-package com.luisurdaneta.log.network.protocol;
+package com.luisurdaneta.log.network.protocol.state;
 
 public final class LogConnContext {
 
+    // FIRST OPCODE RECEIVED SHOULD ALWAYS BE HELLO
     public int state = LogConnState.EXPECT_HELLO;
 
-    // Negotiated from HELLO
+    // NEGOTIATED FROM HELLO
     public long negotiatedPeerVersion = 0;
     public long negotiatedPeerCaps = 0;
 
-    // Current op metadata
+    // CURRENT OP METADATA
     public long currentUuidHi = 0;
     public long currentUuidLo = 0;
     public long expectedSegmentBytes = 0;
     public long bytesTransferred = 0;
 
-    // Parsed header fields (no FrameHeader allocation)
+    // PARSED HEADER FIELDS
     public int  hdrMagic;
     public int  hdrType;
     public long hdrPayloadLen;

@@ -1,44 +1,50 @@
-package com.luisurdaneta.log.network.protocol;
+package com.luisurdaneta.log.network.protocol.state;
+import com.luisurdaneta.log.network.protocol.constants.LogMessageTypes;
+
 import java.nio.ByteBuffer;
 
-import static com.luisurdaneta.log.network.protocol.LogConnState.*;
-import static com.luisurdaneta.log.network.protocol.LogMessageTypes.*;
-import static com.luisurdaneta.log.network.protocol.LogProtocolConstants.*;
+import static com.luisurdaneta.log.network.protocol.state.LogConnState.*;
+import static com.luisurdaneta.log.network.protocol.constants.LogProtocolConstants.*;
 
 public final class LogProtocolRules {
     private LogProtocolRules() {}
 
-    // Error codes (avoid exceptions on hot path)
     public static final int OK               = 0;
     public static final int ERR_BAD_MAGIC    = -1;
     public static final int ERR_BAD_LENGTH   = -2;
     public static final int ERR_DISALLOWED   = -3;
 
+    /** OPCODES ALLOWED PER CONNECTION STATE */
     public static boolean isAllowed(int state, int msgType) {
+
+        if (msgType == LogMessageTypes.ERROR) return true;
+
         return switch (state) {
-            case EXPECT_HELLO -> msgType == HELLO;
-            case READY -> msgType == WRITE || msgType == READ || msgType == PING || msgType == PONG;
-            case WRITE_RECV -> msgType == DATA || msgType == PING || msgType == PONG;
-            case READ_SEND -> msgType == ACK || msgType == PING || msgType == PONG;
+            case EXPECT_HELLO -> msgType == LogMessageTypes.HELLO;
+
+            case READY -> msgType == LogMessageTypes.WRITE
+                    || msgType == LogMessageTypes.READ
+                    || msgType == LogMessageTypes.PING
+                    || msgType == LogMessageTypes.PONG;
+
+            case WRITE_RECV -> msgType == LogMessageTypes.DATA
+                    || msgType == LogMessageTypes.PING
+                    || msgType == LogMessageTypes.PONG;
+
+            case READ_SEND -> msgType == LogMessageTypes.ACK
+                    || msgType == LogMessageTypes.PING
+                    || msgType == LogMessageTypes.PONG;
+
             default -> false;
         };
     }
 
-    /**
-     * Parse header bytes already in headerBuf into ctx.
-     * headerBuf must be flipped and positioned at 0 with >= 16 bytes.
-     */
     public static void parseHeaderInto(LogConnContext ctx, ByteBuffer headerBuf) {
         ctx.hdrMagic      = headerBuf.getInt();
         ctx.hdrType       = headerBuf.getInt();
         ctx.hdrPayloadLen = headerBuf.getLong();
     }
 
-    /**
-     * Step 0 invariants:
-     * - bad magic => close immediately
-     * - payload length sanity check
-     */
     public static int validateHeader(LogConnContext ctx) {
         if (ctx.hdrMagic != MAGIC_QLOG) {
             return ERR_BAD_MAGIC;
@@ -49,9 +55,6 @@ public final class LogProtocolRules {
         return OK;
     }
 
-    /**
-     * State-machine enforcement.
-     */
     public static int validateAllowed(LogConnContext ctx) {
         return isAllowed(ctx.state, ctx.hdrType) ? OK : ERR_DISALLOWED;
     }

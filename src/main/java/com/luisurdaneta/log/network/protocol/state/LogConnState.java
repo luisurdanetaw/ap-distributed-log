@@ -1,4 +1,4 @@
-package com.luisurdaneta.log.network.protocol;
+package com.luisurdaneta.log.network.protocol.state;
 
 public final class LogConnState {
     private LogConnState() {}

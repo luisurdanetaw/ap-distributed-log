@@ -1,4 +1,4 @@
-package com.luisurdaneta.log.memory;
+package com.luisurdaneta.log.memory.segment;
 
 import java.io.IOException;
 import java.lang.foreign.Arena;
@@ -11,53 +11,154 @@ import java.nio.file.StandardOpenOption;
 import java.util.UUID;
 import java.util.zip.CRC32C;
 
-import static com.luisurdaneta.log.memory.SegmentConstants.*;
+import static com.luisurdaneta.log.memory.segment.SegmentConstants.*;
 
 /**
- * =============================================================================
- * LogSegment — QLOG Segment Format v2 (Simplified Append-Only)
- * =============================================================================
- *
- * This class owns a single memory-mapped segment file.
- *
- * FORMAT SUMMARY (v2)
- * ------------------
- * • Page 0 (0..4095) is reserved for the "superblock region".
- * • Only the first 64 bytes of page 0 are defined; the rest is reserved.
- * • Data region starts at DATA_OFFSET (4096) and contains a sequence of entries.
- *
- * SUPERBLOCK (first 64 bytes)
- * ---------------------------
- *   0x00 u32 magic              = "QLOG"
- *   0x04 u16 version            = 2
- *   0x06 u16 header_bytes       = 64
- *   0x08 u64 file_uuid_hi
- *   0x10 u64 file_uuid_lo
- *   0x18 u64 created_unix_nanos
- *   0x20 u64 committed_tail     (absolute file offset)
- *   0x28 u64 file_capacity
- *   0x30 u32 flags
- *   0x34 u32 superblock_crc32   (optional; may be 0)
- *
- * COMMIT MODEL (All-or-Nothing)
- * -----------------------------
- * committed_tail is the ONLY authoritative indicator of what bytes are valid.
- *
- * Writer appends:
- *   1) Writes entry header + payload + padding at the current tail (uncommitted region)
- *   2) (optional) fsync/force depending on durability policy
- *   3) Advances committed_tail in superblock to publish those bytes as durable/visible
- *
- * Recovery:
- *   • Trust bytes in [DATA_OFFSET, committed_tail)
- *   • Ignore everything at or beyond committed_tail
- *
- * DESIGN CHOICES vs v1
- * --------------------
- * • Removed per-entry seq, entry_count, generation, header CRC, total_len/padding_len fields.
- *   These are either redundant, derivable, or unnecessary for an unordered append-only log.
- * • Timestamp is kept per entry for LWW use-cases.
+ * ================================================================================
+ *  LogSegment — QLOG Segment Format v2 (Simplified Append-Only, mmap-owned)
+ * ================================================================================
+
+ *  This class owns ONE memory-mapped segment file and provides the *minimum*
+ *  machinery to:
+ *    - create or open the file
+ *    - validate/initialize the superblock
+ *    - expose the MemorySegment for fast append-style writers
+ *    - publish durability/visibility via a single committed tail pointer
+
+ *  The design is intentionally "dumb fast":
+ *    - No indexing
+ *    - No per-entry global ordering guarantees
+ *    - Visibility is controlled ONLY by committed_tail
+
+ * ================================================================================
+ *  FILE FORMAT SUMMARY (v2)
+ * ================================================================================
+
+ *  Endianness
+ *  ----------
+ *  • All multi-byte fields are LITTLE-ENDIAN.
+
+ *  Layout
+ *  ------
+ *  • File offset 0..4095 is reserved for the superblock page (SUPERBLOCK_SIZE = 4096).
+ *  • Only the first SUPERBLOCK_USED bytes (64B) are defined.
+ *  • Data region begins at DATA_OFFSET (4096) and stores a sequence of entries.
+ *  • Entries are aligned to ENTRY_ALIGNMENT (16 bytes).
+
+ * ================================================================================
+ *  DURABILITY / VISIBILITY MODEL (Single Authoritative Pointer)
+ * ================================================================================
+
+ *  committed_tail is the ONLY authoritative indicator of what bytes are valid.
+
+ *    - Bytes in [DATA_OFFSET, committed_tail) are durable/visible.
+ *    - Bytes >= committed_tail are uncommitted garbage (ignore on recovery).
+
+ *  This enables ALL-OR-NOTHING visibility:
+ *    - Writers may stream bytes into the uncommitted region (in chunks).
+ *    - The entry becomes visible ONLY after committed_tail advances past it.
+ *    - If a writer crashes mid-stream, committed_tail is unchanged and recovery
+ *      ignores the partial bytes completely.
+
+ * ================================================================================
+ *  SUPERBLOCK (first 64 bytes of page 0)
+ * ================================================================================
+
+ *  Offset  Size  Field
+ *  ------  ----  ------------------------------------------------
+ *  0x00    u32   MAGIC              = "QLOG"
+ *  0x04    u16   VERSION            = 2
+ *  0x06    u16   HEADER_BYTES       = 64
+ *  0x08    u64   FILE_UUID_HI
+ *  0x10    u64   FILE_UUID_LO
+ *  0x18    u64   CREATED_UNIX_NANOS
+ *  0x20    u64   COMMITTED_TAIL     (absolute file offset)
+ *  0x28    u64   FILE_CAPACITY      (bytes)
+ *  0x30    u32   FLAGS              (reserved for future use)
+ *  0x34    u32   SUPERBLOCK_CRC32   (optional; 0 = disabled)
+
+ *  Notes
+ *  -----
+ *  • CRC32C covers bytes [0 .. SB_CRC32) (excludes the CRC field itself).
+ *  • If SUPERBLOCK_CRC32 is 0, CRC validation is treated as disabled.
+ *  • The remainder of the 4KB page is reserved (future growth, stats, etc.).
+
+ * ================================================================================
+ *  ENTRY FORMAT (append-only)
+ * ================================================================================
+
+ *  Each entry is written into the uncommitted region, then committed_tail advances.
+
+ *  Entry layout at an aligned entry_start:
+ *    [32B fixed header]
+ *    [payload_len bytes payload]
+ *    [0..15B padding to 16B alignment]
+
+ *  Padding is derived:
+ *    pad = (ENTRY_ALIGNMENT - ((ENTRY_HEADER_SIZE + payload_len) % ENTRY_ALIGNMENT)) % ENTRY_ALIGNMENT
+
+ *  There is NO stored total_len field in v2 — readers compute total_len from payload_len.
+
+ * ================================================================================
+ *  STREAMING WRITE SUPPORT (IMPORTANT)
+ * ================================================================================
+
+ *  Supports streaming writes of large payloads:
+
+ *    1) Reserve space conceptually at tail (caller-owned bookkeeping)
+ *    2) Write the 32B entry header at entry_start
+ *    3) Stream the payload bytes into the mapped region in chunks
+ *         - e.g. 4KB / 64KB chunks
+ *         - CRC32C may be computed incrementally while streaming
+ *    4) Write padding (if needed)
+ *    5) Publish by advancing committed_tail to end_of_entry_aligned
+
+ *  Key property:
+ *    - Streaming is allowed
+ *    - Partial visibility is NOT allowed
+ *    - Only committed_tail makes data real
+
+ * ================================================================================
+ *  ENTRY HEADER (32 bytes)
+ * ================================================================================
+
+ *  Offset  Size  Field
+ *  ------  ----  ------------------------------------------------
+ *  0x00    u32   MAGIC = "ENTR"
+ *  0x04    u16   HEADER_BYTES = 32
+ *  0x06    u16   FLAGS
+ *                 bit 0 → payload compressed
+ *                 bit 1 → payload_crc32 valid
+ *                 bit 2 → tombstone (delete marker)
+ *  0x08    u32   TYPE             (application-defined)
+ *  0x0C    u32   CODEC            (0 = none, 1 = zstd, ...)
+ *  0x10    u64   TS_UNIX_NANOS     (used for LWW conflict resolution)
+ *  0x18    u32   PAYLOAD_LEN      (bytes on disk)
+ *  0x1C    u32   PAYLOAD_CRC32    (optional; 0 if unused)
+
+ * ================================================================================
+ *  INVARIANTS & EXPECTATIONS
+ * ================================================================================
+
+ *  • This class does NOT implement the append/write logic itself.
+ *    It only provides:
+ *      - the mapped MemorySegment
+ *      - a cached committedTail
+ *      - checkpointCommittedTail() to publish new durable bytes
+
+ *  • Concurrency:
+ *      - Intended for a single-writer model per LogSegment instance.
+ *      - Writers must ensure they do not overlap in the uncommitted region.
+
+ *  • Recovery:
+ *      - Readers should scan from DATA_OFFSET up to committedTail.
+ *      - Any trailing bytes beyond committedTail are ignored.
+
+ *  • Resizing:
+ *      - Not supported in this implementation (capacity is fixed once mapped).
+ *      - validateSuperblock() enforces superblock capacity == mapped capacity.
  */
+
 public final class LogSegment implements AutoCloseable {
 
     // Immutable instance state
@@ -91,17 +192,12 @@ public final class LogSegment implements AutoCloseable {
         refreshCachedSuperblock();
     }
 
-    /**
-     * Load existing segment or initialize a new one (v2 layout).
-     *
-     * @param path            file path
-     * @param initialCapacity requested file size for new files (bytes)
-     */
     public static LogSegment loadOrInit(Path path, long initialCapacity) throws IOException {
         FileChannel chan;
         long capacity;
         boolean isNew;
 
+        // Avoid TOCTOU race condition by relying on atomic CREATE_NEW open instead of checking existence first
         try {
             if (initialCapacity < MIN_CAPACITY) {
                 throw new IllegalArgumentException(INITIAL_CAP_TOO_SMALL + initialCapacity + " < " + MIN_CAPACITY);
@@ -153,11 +249,6 @@ public final class LogSegment implements AutoCloseable {
         return logSeg;
     }
 
-    /**
-     * Initialize the v2 superblock.
-     *
-     * NOTE: The reserved bytes are already zero from file creation; we only write defined fields.
-     */
     private void initializeSuperblock() {
         final long nowNanos = System.currentTimeMillis() * 1_000_000L;
         final UUID uuid = UUID.randomUUID();
@@ -176,20 +267,15 @@ public final class LogSegment implements AutoCloseable {
 
         segment.set(INT_LE, SB_FLAGS, 0);
 
-        // Optional CRC32C: if you want to disable CRC entirely, leave SB_CRC32 = 0
         int crc = computeSuperblockCRC32();
         segment.set(INT_LE, SB_CRC32, crc);
 
-        // Ensure visibility/durability
+        // Ensure superblock visibility/durability
         segment.force();
 
         refreshCachedSuperblock();
     }
 
-    /**
-     * Validate v2 superblock on load.
-     * If stored CRC32 is 0, CRC validation is treated as disabled (backward/ops-friendly).
-     */
     private void validateSuperblock() throws IOException {
         int magic = segment.get(INT_LE, SB_MAGIC);
         if (magic != MAGIC_QLOG) {
@@ -208,7 +294,6 @@ public final class LogSegment implements AutoCloseable {
 
         long cap = segment.get(LONG_LE, SB_FILE_CAPACITY);
         if (cap != fileCapacity) {
-            // If you want to allow remapping/resizing later, relax this check.
             throw new IOException("File capacity mismatch: superblock=" + cap + " mapped=" + fileCapacity);
         }
 
@@ -233,10 +318,6 @@ public final class LogSegment implements AutoCloseable {
         refreshCachedSuperblock();
     }
 
-    /**
-     * CRC32C over superblock bytes [0..SB_CRC32) i.e., excludes the CRC field itself.
-     * This is stable and avoids needing to "zero-out" a field in-place.
-     */
     private int computeSuperblockCRC32() {
         CRC32C crc = crcThreadLocal.get();
         crc.reset();
@@ -260,13 +341,10 @@ public final class LogSegment implements AutoCloseable {
 
     public long getCommittedTail() { return committedTail; }
 
-    /**
-     * Direct access to mapped bytes. Readers/writers must obey layout invariants.
-     */
     public MemorySegment getSegment() { return segment; }
 
     /**
-     * Publish a new committed tail (the ONLY mutable superblock field in v2).
+     * Publish a new committed tail (the ONLY mutable superblock field).
      *
      * Requirements:
      * • newTail must be <= fileCapacity

@@ -1,27 +1,36 @@
 package com.luisurdaneta.log.network.server;
 
-import com.luisurdaneta.log.network.protocol.ConnectionHandler;
+import com.luisurdaneta.log.memory.segment.LogSegmentPool;
+import com.luisurdaneta.log.network.protocol.handler.ConnectionHandler;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.channels.AsynchronousCloseException;
 import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
+import java.nio.file.Path;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
+
 public final class Server implements AutoCloseable {
     private final int port;
-    private final ConnectionLimiter limiter;
-    private final ConnectionHandler handler;
 
-    private final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+    private final ConnectionHandler handler;
+    private final LogSegmentPool segmentPool;
+    private final ExecutorService executor;
+
     private ServerSocketChannel server;
 
-    public Server(int port, int maxConnections, ConnectionHandler handler) {
+    public Server(int port,
+                  Path segmentDir,
+                  int maxSegments,
+                  long initialCapacity,
+                  ConnectionHandler handler) throws IOException {
         this.port = port;
-        this.limiter = new ConnectionLimiter(maxConnections);
         this.handler = handler;
+        this.segmentPool = new LogSegmentPool(segmentDir, maxSegments, initialCapacity);
+        this.executor = Executors.newFixedThreadPool(maxSegments);
     }
 
     public void start() throws IOException {
@@ -35,26 +44,25 @@ public final class Server implements AutoCloseable {
 
         System.out.println("Server listening on port " + port);
 
-        while (!Thread.currentThread().isInterrupted()) {
-            SocketChannel client;
+        for(;;) {
+            final SocketChannel client;
             try {
                 client = server.accept(); // blocks
             } catch (AsynchronousCloseException e) {
                 break; // shutdown
             }
 
-            if (!limiter.tryAcquire()) {
-                client.close();
+            LogSegmentPool.Lease lease = segmentPool.tryAcquire();
+            if (lease == null) {
+                client.close(); // no free segment -> reject
                 continue;
             }
 
             executor.execute(() -> {
-                try (client) {
-                    handler.handle(client);
+                try (client; lease) {
+                    handler.handle(client, lease.segment());
                 } catch (IOException ignored) {
                     // client reset/disconnect/etc
-                } finally {
-                    limiter.release();
                 }
             });
         }

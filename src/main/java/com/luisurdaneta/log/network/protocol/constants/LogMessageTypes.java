@@ -1,4 +1,4 @@
-package com.luisurdaneta.log.network.protocol;
+package com.luisurdaneta.log.network.protocol.constants;
 
 public final class LogMessageTypes {
     private LogMessageTypes() {}
